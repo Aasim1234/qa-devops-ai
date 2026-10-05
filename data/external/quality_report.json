@@ -1,0 +1,19 @@
+{
+  "input_records": 3000,
+  "invalid_removed": 0,
+  "exact_duplicates_removed": 2365,
+  "final_records": 635,
+  "categories": {
+    "kubernetes": 69,
+    "terraform": 55,
+    "aws": 50,
+    "git": 54,
+    "docker": 55,
+    "linux": 74,
+    "jenkins": 30,
+    "sre": 209,
+    "ansible": 30,
+    "grafana": 5,
+    "prometheus": 4
+  }
+}

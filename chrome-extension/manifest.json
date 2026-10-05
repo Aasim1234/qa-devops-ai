@@ -1,0 +1,21 @@
+﻿{
+  "manifest_version": 3,
+  "name": "QA DevOps AI",
+  "version": "1.2.0",
+  "description": "Voice-enabled QA and DevOps interview assistant.",
+  "permissions": [
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Open QA DevOps AI"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

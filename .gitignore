@@ -1,0 +1,31 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+
+# Local models / indexes
+models/
+checkpoints/
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Local runtime files
+*.tmp
+
+# Ollama/local files
+ollama/
