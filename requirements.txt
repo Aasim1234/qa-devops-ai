@@ -1,6 +1,8 @@
-fastapi
-uvicorn[standard]
-requests
-numpy
-faiss-cpu
-sentence-transformers
+# API server runtime (local + Render). Versions tested with Python 3.12.
+# training/scripts need sentence-transformers too: see requirements-training.txt
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+requests==2.34.2
+numpy==2.5.3
+faiss-cpu==1.15.1
+fastembed==0.8.1

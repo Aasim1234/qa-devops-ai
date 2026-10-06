@@ -1,0 +1,6 @@
+# Offline tools in training/scripts (dataset building, re-embedding, evaluation).
+# Not needed by the API server; install locally only:
+#   pip install -r requirements-training.txt
+-r requirements.txt
+sentence-transformers
+pypdf

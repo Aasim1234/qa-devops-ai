@@ -6,8 +6,14 @@ __pycache__/
 !.env.example
 
 # Local models / indexes
-models/
+# The combined FAISS index (~4 MB) is committed because the API needs it at runtime.
+models/*
+!models/combined.index
+!models/combined_metadata.pkl
 checkpoints/
+
+# Downloaded embedding model cache (MODEL_CACHE_DIR)
+.cache/
 
 # Python cache
 .pytest_cache/

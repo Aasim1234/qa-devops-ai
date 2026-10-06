@@ -1,199 +1,175 @@
-﻿from fastapi import FastAPI
-from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-import faiss
-import pickle
-import requests
-import numpy as np
+"""QA DevOps AI - FastAPI entry point.
 
-app = FastAPI(title="QA DevOps AI")
+Run locally:   uvicorn app.api:app --host 0.0.0.0 --port 8000
+Run on Render: uvicorn app.api:app --host 0.0.0.0 --port $PORT
 
-# -----------------------------
-# Configuration
-# -----------------------------
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:1b"
+Importing this module must stay cheap: no model downloads, no FAISS loading
+and no network calls happen here, so Uvicorn can bind its port right away.
+The knowledge base loads lazily (and optionally warms up in a background
+thread after the server has started).
+"""
+import logging
+import threading
+from contextlib import asynccontextmanager
 
-INDEX_PATH = r"S:\qa-devops-ai\models\combined.index"
-METADATA_PATH = r"S:\qa-devops-ai\models\combined_metadata.pkl"
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-FAISS_TOP_K = 3
-FINAL_CONTEXTS = 2
-MIN_FAISS_SCORE = 0.25
+from .config import settings
 
-# -----------------------------
-# Load models
-# -----------------------------
-print("Loading embedding model...")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+logging.basicConfig(
+    level=settings.log_level,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # model-download request spam
+log = logging.getLogger("qa_devops_ai")
 
-print("Loading FAISS knowledge base...")
-index = faiss.read_index(INDEX_PATH)
+log.info("Starting QA DevOps AI...")
+log.info("Loading configuration...")
 
-with open(METADATA_PATH, "rb") as f:
-    metadata = pickle.load(f)
+from .llm import LLMClient, LLMUnavailable  # noqa: E402
+from .rag import KnowledgeBase, RagUnavailable, knowledge_base_answer  # noqa: E402
 
-print(f"Knowledge base loaded: {index.ntotal} vectors")
+knowledge_base = KnowledgeBase(settings)
+llm = LLMClient(settings)
+
+log.info(
+    "Configuration: llm_provider=%s llm_model=%s embedding_model=%s index=%s warmup=%s",
+    llm.provider,
+    llm.model or "-",
+    settings.embedding_model,
+    settings.index_path,
+    settings.warmup_on_startup,
+)
 
 
-# -----------------------------
-# Request model
-# -----------------------------
+def _warm_up_knowledge_base() -> None:
+    try:
+        knowledge_base.ensure_loaded()
+    except Exception:
+        # Already logged by KnowledgeBase; /ask will retry later.
+        log.warning("Knowledge base warm-up failed; the API keeps running without it.")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if settings.warmup_on_startup:
+        # Daemon thread: the server starts listening without waiting for it.
+        threading.Thread(
+            target=_warm_up_knowledge_base, name="kb-warmup", daemon=True
+        ).start()
+        log.info("Knowledge base warm-up started in the background.")
+    log.info("FastAPI startup complete.")
+    yield
+
+
+app = FastAPI(title=settings.service_name, version=settings.version, lifespan=lifespan)
+
+# Chrome extension pages and local tools call this API from another origin.
+if settings.cors_allow_origins:
+    cors = {"allow_origins": settings.cors_allow_origins}
+else:
+    cors = {
+        "allow_origin_regex": (
+            r"^(chrome-extension://[a-p]{32}"
+            r"|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
+        )
+    }
+app.add_middleware(
+    CORSMiddleware,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    allow_credentials=False,
+    **cors,
+)
+
+
 class AskRequest(BaseModel):
-    question: str
+    question: str = Field(..., max_length=settings.max_question_chars)
 
 
-# -----------------------------
-# Health
-# -----------------------------
 @app.get("/")
 def root():
     return {
-        "service": "QA DevOps AI",
+        "service": settings.service_name,
         "status": "running",
-        "model": OLLAMA_MODEL
+        "version": settings.version,
+        "endpoints": ["GET /health", "GET /status", "POST /ask"],
     }
 
 
 @app.get("/health")
 def health():
+    """Liveness check. Never loads models and never fails because of Ollama/LLM."""
+    llm_available = llm.available()
     return {
         "status": "ok",
-        "service": "QA DevOps AI",
-        "model": OLLAMA_MODEL,
-        "vectors": index.ntotal
+        "service": settings.service_name,
+        "version": settings.version,
+        "knowledge_base": knowledge_base.state,
+        "llm_provider": llm.provider,
+        "llm_available": llm_available,
+        # Kept for the Chrome extension's status badge ("Online" vs "Ollama OFF").
+        "ollama": llm_available,
     }
 
 
-# -----------------------------
-# Knowledge retrieval
-# -----------------------------
-def retrieve_context(question: str):
-
-    embedding = embedder.encode(
-        [question],
-        normalize_embeddings=True
-    ).astype("float32")
-
-    scores, indices = index.search(
-        embedding,
-        FAISS_TOP_K
-    )
-
-    contexts = []
-
-    for score, idx in zip(scores[0], indices[0]):
-
-        if idx < 0:
-            continue
-
-        if float(score) < MIN_FAISS_SCORE:
-            continue
-
-        item = metadata[idx]
-
-        if isinstance(item, dict):
-            text = (
-                item.get("text")
-                or item.get("content")
-                or item.get("chunk")
-                or ""
-            )
-        else:
-            text = str(item)
-
-        if text:
-            contexts.append(text)
-
-        if len(contexts) >= FINAL_CONTEXTS:
-            break
-
-    return contexts
-
-
-# -----------------------------
-# Answer generation
-# -----------------------------
-def generate_answer(question: str, contexts):
-
-    context_text = "\n\n---\n\n".join(contexts)
-
-    prompt = f"""
-You are a real-time DevOps and QA interview assistant.
-
-Answer the interviewer's question directly.
-
-IMPORTANT RULES:
-- Be concise and natural.
-- Do not think aloud.
-- Do not explain your reasoning process.
-- Do not repeat the question.
-- For simple definitions: 1-3 sentences.
-- For technical questions: give the key answer first, then important details.
-- For troubleshooting scenarios: give a clear step-by-step approach.
-- Mention commands when they are genuinely useful.
-- Do not invent personal experience, metrics, companies, projects, or results.
-- Use the supplied knowledge when relevant.
-- If the supplied knowledge is insufficient, use reliable general DevOps knowledge.
-- Do not dump the entire knowledge base into the answer.
-- Sound like a candidate answering an interviewer, not like a textbook.
-
-Knowledge context:
-{context_text}
-
-Interview question:
-{question}
-
-Answer:
-"""
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 160
-        }
+@app.get("/status")
+def status():
+    """Detailed component status (no secrets). Does not trigger model loading."""
+    return {
+        "service": settings.service_name,
+        "version": settings.version,
+        "knowledge_base": knowledge_base.status(),
+        "llm": llm.status(),
+        "kb_fallback": settings.kb_fallback,
     }
 
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
-        timeout=120
-    )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    return data.get("response", "").strip()
-
-
-# -----------------------------
-# Ask endpoint
-# -----------------------------
 @app.post("/ask")
 def ask(request: AskRequest):
-
     question = request.question.strip()
 
     if not question:
-        return {
-            "answer": "Please provide a question."
-        }
+        return {"answer": "Please provide a question."}
 
-    contexts = retrieve_context(question)
+    contexts = []
+    rag_error = None
+    try:
+        contexts = knowledge_base.search(question)
+    except RagUnavailable as e:
+        rag_error = str(e)
+        log.warning("Answering without knowledge base: %s", rag_error)
 
-    answer = generate_answer(
-        question,
-        contexts
-    )
+    try:
+        answer = llm.generate(question, [c.text for c in contexts])
+    except LLMUnavailable as e:
+        llm_error = str(e)
+        log.warning("LLM unavailable: %s", llm_error)
+
+        if settings.kb_fallback and contexts:
+            return {
+                "question": question,
+                "answer": (
+                    "Note: AI model unavailable - showing the closest "
+                    "knowledge-base answer.\n\n" + knowledge_base_answer(contexts)
+                ),
+                "contexts_used": len(contexts),
+                "llm_used": False,
+                "llm_error": llm_error,
+            }
+
+        detail = f"AI model unavailable: {llm_error}."
+        if rag_error:
+            detail += f" Knowledge base unavailable: {rag_error}"
+        elif not contexts:
+            detail += " No close knowledge-base match was found either."
+        raise HTTPException(status_code=503, detail=detail)
 
     return {
         "question": question,
         "answer": answer,
-        "contexts_used": len(contexts)
+        "contexts_used": len(contexts),
+        "llm_used": True,
     }
-
-
